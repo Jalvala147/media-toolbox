@@ -57,7 +57,7 @@ git tag v2.2.0
 git push origin v2.2.0
 ```
 
-## Empaquetar en tu PC (Windows)
+## Empaquetar en Windows
 
 ```bash
 pyinstaller main.spec
