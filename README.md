@@ -26,6 +26,12 @@ media-toolbox
 
 Los instaladores y wheels también salen en [Releases](https://github.com/Jalvala147/media-toolbox/releases).
 
+El recuadro **Packages** del repo es la imagen de GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/jalvala147/media-toolbox:latest
+```
+
 O clonar y correr en desarrollo:
 
 ```bash
