@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import io
 import os
 import subprocess
 import sys
+import tempfile
+import zipfile
 from pathlib import Path
 
 import flet as ft
 
-from core.files import AUDIO_EXTS, HEIC_EXTS, IMAGE_EXTS, VIDEO_EXTS, collect_files, normalize_extension
+from core.files import AUDIO_EXTS, HEIC_EXTS, IMAGE_EXTS, VIDEO_EXTS, collect_files, normalize_extension, unique_path
 from core.images import convert_heic_to_jpeg, convert_image, output_image_path, resize_image
 from core.media import (
     compress_for_whatsapp,
@@ -28,7 +31,7 @@ from core.metadata import wipe_all_metadata
 from core.organize import apply_organize_plan, build_organize_plan
 from core.rename import apply_rename_plan, build_rename_plan, undo_rename_plan
 
-VERSION = "2.2"
+VERSION = "2.3"
 CYAN = ft.Colors.CYAN_400
 CARD_BG = "#111827"
 PAGE_BG = "#0b1220"
@@ -129,6 +132,81 @@ class MediaToolboxApp:
         if len(self.selected) == 1:
             return self.selected[0]
         return f"{len(self.selected)} elementos seleccionados"
+
+    def _upload_dir(self) -> Path:
+        root = Path(os.getenv("MEDIA_TOOLBOX_UPLOAD_DIR", tempfile.gettempdir())) / "uploads"
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    async def _store_picked(self, files) -> list[str]:
+        if not files:
+            return []
+        native = [item.path for item in files if item.path]
+        if native and not self.page.web:
+            return native
+
+        session = Path(tempfile.mkdtemp(prefix="pick_", dir=str(self._upload_dir())))
+        paths: list[str] = []
+        for item in files:
+            data = getattr(item, "bytes", None)
+            if not data:
+                continue
+            dest = unique_path(session / item.name)
+            dest.write_bytes(data)
+            paths.append(str(dest))
+        if not paths:
+            self.notify("No se pudieron leer los archivos en el navegador.", error=True)
+        return paths
+
+    async def _pick_files_raw(self, **kwargs):
+        kwargs.setdefault("allow_multiple", True)
+        if self.page.web:
+            kwargs["with_data"] = True
+            kwargs.setdefault("cancel_upload_on_window_blur", False)
+        return await self.picker.pick_files(**kwargs) or []
+
+    async def _pick_directory(self, **kwargs) -> str | None:
+        if self.page.web:
+            self.notify("En el navegador elige archivos; las carpetas no están disponibles.", error=True)
+            return None
+        return await self.picker.get_directory_path(**kwargs)
+
+    async def _offer_download(self, outputs: list[Path], root: Path | None = None) -> None:
+        existing = [path for path in outputs if path.exists()]
+        if not existing:
+            return
+        try:
+            if len(existing) == 1 and root is None:
+                await self.picker.save_file(file_name=existing[0].name, src_bytes=existing[0].read_bytes())
+                return
+            buffer = io.BytesIO()
+            with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+                used: set[str] = set()
+                for path in existing:
+                    if root is not None:
+                        try:
+                            name = str(path.relative_to(root))
+                        except ValueError:
+                            name = path.name
+                    else:
+                        name = path.name
+                    if name in used:
+                        name = f"{path.stem}_{len(used) + 1}{path.suffix}"
+                    used.add(name)
+                    archive.write(path, name)
+            await self.picker.save_file(file_name="media_toolbox.zip", src_bytes=buffer.getvalue())
+        except Exception as err:
+            self.notify(f"No se pudo descargar el resultado: {err}", error=True)
+
+    def _deliver_outputs(self, outputs: list[Path], *, folder: Path | None = None, root: Path | None = None) -> None:
+        existing = [path for path in outputs if path.exists()]
+        if self.page.web:
+            if existing:
+                self.page.run_task(self._offer_download, existing, root=root)
+            return
+        target = folder or (existing[0].parent if existing else None)
+        if target:
+            open_path(target)
 
     def file_list(self, paths: list[Path], limit: int = 40) -> ft.Control:
         if not paths:
@@ -249,7 +327,9 @@ class MediaToolboxApp:
                         weight=ft.FontWeight.W_500,
                     ),
                     ft.Text(
-                        "Procesa archivos en tu computadora. Las operaciones pesadas usan ffmpeg.",
+                        "En el navegador elige archivos (no carpetas). Al terminar se descarga el resultado."
+                        if self.page.web
+                        else "Procesa archivos en tu computadora. Las operaciones pesadas usan ffmpeg.",
                         size=13,
                         color=MUTED,
                     ),
@@ -300,33 +380,41 @@ class MediaToolboxApp:
             ),
         )
 
-    def _selection_row(self, picker_kind: str, extensions: list[str] | None = None) -> tuple[ft.Text, ft.Control]:
+    def _selection_row(
+        self,
+        picker_kind: str,
+        extensions: list[str] | None = None,
+        on_change=None,
+    ) -> tuple[ft.Text, ft.Control]:
         summary = ft.Text(self.selected_label(), size=13, color=MUTED, selectable=True)
+
+        def after_pick() -> None:
+            summary.value = self.selected_label()
+            self.page.update()
+            if on_change:
+                on_change()
 
         async def pick_files(e=None):
             file_type = ft.FilePickerFileType.CUSTOM if extensions else ft.FilePickerFileType.ANY
-            files = await self.picker.pick_files(
-                allow_multiple=True,
+            files = await self._pick_files_raw(
                 dialog_title="Selecciona archivos",
                 file_type=file_type,
                 allowed_extensions=[ext.lstrip(".") for ext in extensions] if extensions else None,
             )
             if files:
-                self.selected = [f.path for f in files if f.path]
-                summary.value = self.selected_label()
-                self.page.update()
+                self.selected = await self._store_picked(files)
+                after_pick()
 
         async def pick_folder(e=None):
-            path = await self.picker.get_directory_path(dialog_title="Selecciona una carpeta")
+            path = await self._pick_directory(dialog_title="Selecciona una carpeta")
             if path:
                 self.selected = [path]
-                summary.value = self.selected_label()
-                self.page.update()
+                after_pick()
 
         buttons = [
             ft.FilledButton("Archivos", icon=ft.Icons.INSERT_DRIVE_FILE, on_click=pick_files),
         ]
-        if picker_kind in {"folder", "both"}:
+        if picker_kind in {"folder", "both"} and not self.page.web:
             buttons.append(
                 ft.OutlinedButton("Carpeta", icon=ft.Icons.FOLDER_OPEN, on_click=pick_folder)
             )
@@ -375,7 +463,7 @@ class MediaToolboxApp:
         )
         recursive = ft.Checkbox(label="Incluir subcarpetas", value=False)
         preview_box = ft.Column(spacing=4)
-        summary, buttons = self._selection_row("both")
+        summary, buttons = self._selection_row("both", on_change=lambda e=None: refresh_preview())
 
         def refresh_preview(e=None):
             preview_box.controls.clear()
@@ -440,6 +528,8 @@ class MediaToolboxApp:
                 self.last_rename_plan = plan
                 self.notify(f"Renombrados {count} archivos.")
                 refresh_preview()
+                if count:
+                    self._deliver_outputs([item.destination for item in plan])
             except Exception as err:
                 self.notify(f"Error: {err}", error=True)
 
@@ -460,29 +550,6 @@ class MediaToolboxApp:
                 control.on_change = refresh_preview
             if hasattr(control, "on_select"):
                 control.on_select = refresh_preview
-
-        original_pick_note = summary
-
-        async def pick_and_preview_files(e=None):
-            files = await self.picker.pick_files(allow_multiple=True, dialog_title="Selecciona archivos")
-            if files:
-                paths = [f.path for f in files if f.path]
-                if paths:
-                    self.selected = [str(Path(paths[0]).parent)]
-                    original_pick_note.value = self.selected_label()
-                    refresh_preview()
-
-        async def pick_and_preview_folder(e=None):
-            path = await self.picker.get_directory_path(dialog_title="Selecciona una carpeta")
-            if path:
-                self.selected = [path]
-                original_pick_note.value = self.selected_label()
-                refresh_preview()
-
-        buttons.controls = [
-            ft.FilledButton("Archivos", icon=ft.Icons.INSERT_DRIVE_FILE, on_click=pick_and_preview_files),
-            ft.OutlinedButton("Carpeta", icon=ft.Icons.FOLDER_OPEN, on_click=pick_and_preview_folder),
-        ]
 
         self.set_view(
             self.tool_scaffold(
@@ -520,10 +587,6 @@ class MediaToolboxApp:
         self.status.value = ""
         overwrite = ft.Checkbox(label="Sobrescribir originales (sin copia)", value=False)
         recursive = ft.Checkbox(label="Incluir subcarpetas", value=False)
-        summary, buttons = self._selection_row(
-            "both",
-            [ext.lstrip(".") for ext in sorted(IMAGE_EXTS | AUDIO_EXTS | VIDEO_EXTS)],
-        )
         preview = ft.Column()
 
         def refresh(e=None):
@@ -532,29 +595,11 @@ class MediaToolboxApp:
             self.page.update()
 
         recursive.on_change = refresh
-
-        async def pick_files(e=None):
-            files = await self.picker.pick_files(
-                allow_multiple=True,
-                file_type=ft.FilePickerFileType.CUSTOM,
-                allowed_extensions=[ext.lstrip(".") for ext in sorted(IMAGE_EXTS | AUDIO_EXTS | VIDEO_EXTS)],
-            )
-            if files:
-                self.selected = [f.path for f in files if f.path]
-                summary.value = self.selected_label()
-                refresh()
-
-        async def pick_folder(e=None):
-            path = await self.picker.get_directory_path()
-            if path:
-                self.selected = [path]
-                summary.value = self.selected_label()
-                refresh()
-
-        buttons.controls = [
-            ft.FilledButton("Archivos", icon=ft.Icons.INSERT_DRIVE_FILE, on_click=pick_files),
-            ft.OutlinedButton("Carpeta", icon=ft.Icons.FOLDER_OPEN, on_click=pick_folder),
-        ]
+        summary, buttons = self._selection_row(
+            "both",
+            [ext.lstrip(".") for ext in sorted(IMAGE_EXTS | AUDIO_EXTS | VIDEO_EXTS)],
+            on_change=refresh,
+        )
 
         def run(e=None):
             files = self.gather_files(IMAGE_EXTS | AUDIO_EXTS | VIDEO_EXTS, recursive=bool(recursive.value))
@@ -588,7 +633,6 @@ class MediaToolboxApp:
             options=[ft.DropdownOption(key=ext, text=ext.upper().lstrip(".")) for ext in AUDIO_FORMATS],
             width=220,
         )
-        summary, buttons = self._selection_row("both", [ext.lstrip(".") for ext in VIDEO_EXTS | AUDIO_EXTS])
         preview = ft.Column()
 
         def refresh(e=None):
@@ -596,28 +640,11 @@ class MediaToolboxApp:
             preview.controls = [self.file_list(files)]
             self.page.update()
 
-        async def pick_files(e=None):
-            files = await self.picker.pick_files(
-                allow_multiple=True,
-                file_type=ft.FilePickerFileType.CUSTOM,
-                allowed_extensions=[ext.lstrip(".") for ext in sorted(VIDEO_EXTS | AUDIO_EXTS)],
-            )
-            if files:
-                self.selected = [f.path for f in files if f.path]
-                summary.value = self.selected_label()
-                refresh()
-
-        async def pick_folder(e=None):
-            path = await self.picker.get_directory_path()
-            if path:
-                self.selected = [path]
-                summary.value = self.selected_label()
-                refresh()
-
-        buttons.controls = [
-            ft.FilledButton("Archivos", icon=ft.Icons.INSERT_DRIVE_FILE, on_click=pick_files),
-            ft.OutlinedButton("Carpeta", icon=ft.Icons.FOLDER_OPEN, on_click=pick_folder),
-        ]
+        summary, buttons = self._selection_row(
+            "both",
+            [ext.lstrip(".") for ext in VIDEO_EXTS | AUDIO_EXTS],
+            on_change=refresh,
+        )
 
         def run(e=None):
             if not ffmpeg_available():
@@ -661,7 +688,6 @@ class MediaToolboxApp:
             ],
             width=260,
         )
-        summary, buttons = self._selection_row("both", [ext.lstrip(".") for ext in VIDEO_EXTS | AUDIO_EXTS])
         preview = ft.Column()
 
         def refresh(e=None):
@@ -669,28 +695,11 @@ class MediaToolboxApp:
             preview.controls = [self.file_list(files)]
             self.page.update()
 
-        async def pick_files(e=None):
-            files = await self.picker.pick_files(
-                allow_multiple=True,
-                file_type=ft.FilePickerFileType.CUSTOM,
-                allowed_extensions=[ext.lstrip(".") for ext in sorted(VIDEO_EXTS | AUDIO_EXTS)],
-            )
-            if files:
-                self.selected = [f.path for f in files if f.path]
-                summary.value = self.selected_label()
-                refresh()
-
-        async def pick_folder(e=None):
-            path = await self.picker.get_directory_path()
-            if path:
-                self.selected = [path]
-                summary.value = self.selected_label()
-                refresh()
-
-        buttons.controls = [
-            ft.FilledButton("Archivos", icon=ft.Icons.INSERT_DRIVE_FILE, on_click=pick_files),
-            ft.OutlinedButton("Carpeta", icon=ft.Icons.FOLDER_OPEN, on_click=pick_folder),
-        ]
+        summary, buttons = self._selection_row(
+            "both",
+            [ext.lstrip(".") for ext in VIDEO_EXTS | AUDIO_EXTS],
+            on_change=refresh,
+        )
 
         def run(e=None):
             if not ffmpeg_available():
@@ -735,7 +744,6 @@ class MediaToolboxApp:
             width=220,
         )
         overwrite = ft.Checkbox(label="Sobrescribir originales", value=False)
-        summary, buttons = self._selection_row("both", [ext.lstrip(".") for ext in IMAGE_EXTS])
         preview = ft.Column()
 
         def refresh(e=None):
@@ -743,28 +751,11 @@ class MediaToolboxApp:
             preview.controls = [self.file_list(files)]
             self.page.update()
 
-        async def pick_files(e=None):
-            files = await self.picker.pick_files(
-                allow_multiple=True,
-                file_type=ft.FilePickerFileType.CUSTOM,
-                allowed_extensions=[ext.lstrip(".") for ext in sorted(IMAGE_EXTS)],
-            )
-            if files:
-                self.selected = [f.path for f in files if f.path]
-                summary.value = self.selected_label()
-                refresh()
-
-        async def pick_folder(e=None):
-            path = await self.picker.get_directory_path()
-            if path:
-                self.selected = [path]
-                summary.value = self.selected_label()
-                refresh()
-
-        buttons.controls = [
-            ft.FilledButton("Archivos", icon=ft.Icons.INSERT_DRIVE_FILE, on_click=pick_files),
-            ft.OutlinedButton("Carpeta", icon=ft.Icons.FOLDER_OPEN, on_click=pick_folder),
-        ]
+        summary, buttons = self._selection_row(
+            "both",
+            [ext.lstrip(".") for ext in IMAGE_EXTS],
+            on_change=refresh,
+        )
 
         def process_one(path: Path) -> Path:
             width = parse_int(width_input.value, 1920)
@@ -822,7 +813,6 @@ class MediaToolboxApp:
         self.status.value = ""
         start_input = ft.TextField(label="Inicio", hint_text="00:00:05", value="0", width=160)
         end_input = ft.TextField(label="Fin (vacío = hasta el final)", hint_text="00:00:20", width=220)
-        summary, buttons = self._selection_row("both", [ext.lstrip(".") for ext in VIDEO_EXTS])
         duration_text = ft.Text("", size=13, color=MUTED)
         start_img = ft.Image(src="", width=260, height=150, fit=ft.BoxFit.CONTAIN, border_radius=12, visible=False)
         end_img = ft.Image(src="", width=260, height=150, fit=ft.BoxFit.CONTAIN, border_radius=12, visible=False)
@@ -873,28 +863,11 @@ class MediaToolboxApp:
                 end_img.visible = False
             self.page.update()
 
-        async def pick_files(e=None):
-            files = await self.picker.pick_files(
-                allow_multiple=True,
-                file_type=ft.FilePickerFileType.CUSTOM,
-                allowed_extensions=[ext.lstrip(".") for ext in sorted(VIDEO_EXTS)],
-            )
-            if files:
-                self.selected = [f.path for f in files if f.path]
-                summary.value = self.selected_label()
-                refresh_frames()
-
-        async def pick_folder(e=None):
-            path = await self.picker.get_directory_path()
-            if path:
-                self.selected = [path]
-                summary.value = self.selected_label()
-                refresh_frames()
-
-        buttons.controls = [
-            ft.FilledButton("Archivos", icon=ft.Icons.INSERT_DRIVE_FILE, on_click=pick_files),
-            ft.OutlinedButton("Carpeta", icon=ft.Icons.FOLDER_OPEN, on_click=pick_folder),
-        ]
+        summary, buttons = self._selection_row(
+            "both",
+            [ext.lstrip(".") for ext in VIDEO_EXTS],
+            on_change=refresh_frames,
+        )
         start_input.on_blur = refresh_frames
         end_input.on_blur = refresh_frames
 
@@ -929,7 +902,7 @@ class MediaToolboxApp:
             try:
                 dest = join_clips(files)
                 self.notify(f"Video unido: {dest.name}")
-                open_path(dest.parent)
+                self._deliver_outputs([dest])
             except Exception as err:
                 self.notify(f"Error: {err}", error=True)
             finally:
@@ -981,7 +954,6 @@ class MediaToolboxApp:
             ],
             width=280,
         )
-        summary, buttons = self._selection_row("both", [ext.lstrip(".") for ext in VIDEO_EXTS])
         preview = ft.Column()
 
         def refresh(e=None):
@@ -989,28 +961,11 @@ class MediaToolboxApp:
             preview.controls = [self.file_list(files)]
             self.page.update()
 
-        async def pick_files(e=None):
-            files = await self.picker.pick_files(
-                allow_multiple=True,
-                file_type=ft.FilePickerFileType.CUSTOM,
-                allowed_extensions=[ext.lstrip(".") for ext in sorted(VIDEO_EXTS)],
-            )
-            if files:
-                self.selected = [f.path for f in files if f.path]
-                summary.value = self.selected_label()
-                refresh()
-
-        async def pick_folder(e=None):
-            path = await self.picker.get_directory_path()
-            if path:
-                self.selected = [path]
-                summary.value = self.selected_label()
-                refresh()
-
-        buttons.controls = [
-            ft.FilledButton("Archivos", icon=ft.Icons.INSERT_DRIVE_FILE, on_click=pick_files),
-            ft.OutlinedButton("Carpeta", icon=ft.Icons.FOLDER_OPEN, on_click=pick_folder),
-        ]
+        summary, buttons = self._selection_row(
+            "both",
+            [ext.lstrip(".") for ext in VIDEO_EXTS],
+            on_change=refresh,
+        )
 
         def run(e=None):
             if not ffmpeg_available():
@@ -1042,7 +997,6 @@ class MediaToolboxApp:
         self.selected = []
         self.status.value = ""
         quality_input = ft.TextField(label="Calidad JPG (1-100)", value="90", width=180)
-        summary, buttons = self._selection_row("both", [ext.lstrip(".") for ext in HEIC_EXTS])
         preview = ft.Column()
 
         def refresh(e=None):
@@ -1050,28 +1004,11 @@ class MediaToolboxApp:
             preview.controls = [self.file_list(files)]
             self.page.update()
 
-        async def pick_files(e=None):
-            files = await self.picker.pick_files(
-                allow_multiple=True,
-                file_type=ft.FilePickerFileType.CUSTOM,
-                allowed_extensions=[ext.lstrip(".") for ext in sorted(HEIC_EXTS)],
-            )
-            if files:
-                self.selected = [f.path for f in files if f.path]
-                summary.value = self.selected_label()
-                refresh()
-
-        async def pick_folder(e=None):
-            path = await self.picker.get_directory_path()
-            if path:
-                self.selected = [path]
-                summary.value = self.selected_label()
-                refresh()
-
-        buttons.controls = [
-            ft.FilledButton("Archivos", icon=ft.Icons.INSERT_DRIVE_FILE, on_click=pick_files),
-            ft.OutlinedButton("Carpeta", icon=ft.Icons.FOLDER_OPEN, on_click=pick_folder),
-        ]
+        summary, buttons = self._selection_row(
+            "both",
+            [ext.lstrip(".") for ext in HEIC_EXTS],
+            on_change=refresh,
+        )
 
         def run(e=None):
             files = self.gather_files(HEIC_EXTS)
@@ -1109,7 +1046,6 @@ class MediaToolboxApp:
             ],
             width=260,
         )
-        summary, buttons = self._selection_row("both", [ext.lstrip(".") for ext in VIDEO_EXTS])
         preview = ft.Column()
 
         def refresh(e=None):
@@ -1117,28 +1053,11 @@ class MediaToolboxApp:
             preview.controls = [self.file_list(files)]
             self.page.update()
 
-        async def pick_files(e=None):
-            files = await self.picker.pick_files(
-                allow_multiple=True,
-                file_type=ft.FilePickerFileType.CUSTOM,
-                allowed_extensions=[ext.lstrip(".") for ext in sorted(VIDEO_EXTS)],
-            )
-            if files:
-                self.selected = [f.path for f in files if f.path]
-                summary.value = self.selected_label()
-                refresh()
-
-        async def pick_folder(e=None):
-            path = await self.picker.get_directory_path()
-            if path:
-                self.selected = [path]
-                summary.value = self.selected_label()
-                refresh()
-
-        buttons.controls = [
-            ft.FilledButton("Archivos", icon=ft.Icons.INSERT_DRIVE_FILE, on_click=pick_files),
-            ft.OutlinedButton("Carpeta", icon=ft.Icons.FOLDER_OPEN, on_click=pick_folder),
-        ]
+        summary, buttons = self._selection_row(
+            "both",
+            [ext.lstrip(".") for ext in VIDEO_EXTS],
+            on_change=refresh,
+        )
 
         def run(e=None):
             if not ffmpeg_available():
@@ -1180,9 +1099,15 @@ class MediaToolboxApp:
         )
         move = ft.Checkbox(label="Mover (en vez de copiar)", value=False)
         recursive = ft.Checkbox(label="Incluir subcarpetas", value=True)
-        dest_label = ft.Text("Carpeta destino: la misma de origen", size=13, color=MUTED, selectable=True)
+        dest_label = ft.Text(
+            "En el navegador el resultado se descarga en un ZIP."
+            if self.page.web
+            else "Carpeta destino: la misma de origen",
+            size=13,
+            color=MUTED,
+            selectable=True,
+        )
         dest_folder: list[str] = []
-        summary, buttons = self._selection_row("both")
         preview_box = ft.Column()
 
         def source_root() -> Path | None:
@@ -1226,34 +1151,20 @@ class MediaToolboxApp:
 
         recursive.on_change = refresh
         layout.on_select = refresh
-
-        async def pick_files(e=None):
-            files = await self.picker.pick_files(allow_multiple=True)
-            if files:
-                self.selected = [f.path for f in files if f.path]
-                summary.value = self.selected_label()
-                refresh()
-
-        async def pick_folder(e=None):
-            path = await self.picker.get_directory_path(dialog_title="Carpeta de origen")
-            if path:
-                self.selected = [path]
-                summary.value = self.selected_label()
-                refresh()
+        summary, buttons = self._selection_row("both", on_change=refresh)
 
         async def pick_dest(e=None):
-            path = await self.picker.get_directory_path(dialog_title="Carpeta destino")
+            path = await self._pick_directory(dialog_title="Carpeta destino")
             if path:
                 dest_folder.clear()
                 dest_folder.append(path)
                 dest_label.value = f"Carpeta destino: {path}"
                 refresh()
 
-        buttons.controls = [
-            ft.FilledButton("Archivos", icon=ft.Icons.INSERT_DRIVE_FILE, on_click=pick_files),
-            ft.OutlinedButton("Carpeta origen", icon=ft.Icons.FOLDER_OPEN, on_click=pick_folder),
-            ft.TextButton("Elegir destino", icon=ft.Icons.DRIVE_FILE_MOVE, on_click=pick_dest),
-        ]
+        if not self.page.web:
+            buttons.controls.append(
+                ft.TextButton("Elegir destino", icon=ft.Icons.DRIVE_FILE_MOVE, on_click=pick_dest)
+            )
 
         def run(e=None):
             files = self.gather_files(recursive=bool(recursive.value))
@@ -1265,7 +1176,7 @@ class MediaToolboxApp:
                 plan = build_organize_plan(files, root, layout=layout.value or "year_month")
                 count = apply_organize_plan(plan, move=bool(move.value))
                 self.notify(f"Organizados {count} archivos en {root}")
-                open_path(root)
+                self._deliver_outputs([item.destination for item in plan], folder=root, root=root)
                 refresh()
             except Exception as err:
                 self.notify(f"Error: {err}", error=True)
@@ -1300,12 +1211,19 @@ class MediaToolboxApp:
             return
         ok = 0
         errors: list[str] = []
+        outputs: list[Path] = []
         last_dir = files[0].parent
         self.set_busy(True, 0, len(files))
         try:
             for index, path in enumerate(files, start=1):
                 try:
-                    worker(path)
+                    result = worker(path)
+                    if isinstance(result, Path):
+                        outputs.append(result)
+                    elif isinstance(result, (list, tuple)):
+                        outputs.extend(item for item in result if isinstance(item, Path))
+                    else:
+                        outputs.append(path)
                     ok += 1
                 except Exception as err:
                     errors.append(f"{path.name}: {err}")
@@ -1314,11 +1232,13 @@ class MediaToolboxApp:
             self.set_busy(False, len(files), len(files))
         if errors and ok:
             self.notify(f"{done_label}: {ok}. Fallaron {len(errors)}. {errors[0]}")
+            if self.page.web:
+                self._deliver_outputs(outputs)
         elif errors:
             self.notify(f"Error: {errors[0]}", error=True)
         else:
             self.notify(f"{done_label}: {ok} archivo(s).")
-            open_path(last_dir)
+            self._deliver_outputs(outputs, folder=last_dir)
 
 
 def main(page: ft.Page):
