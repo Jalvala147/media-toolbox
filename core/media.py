@@ -270,6 +270,140 @@ def strip_av_metadata(
             tmp.unlink(missing_ok=True)
 
 
+def format_timestamp(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def probe_duration(src: str | Path) -> float:
+    src = Path(src)
+    if not shutil.which("ffprobe"):
+        raise FFmpegNotFoundError("No se encontró ffprobe (viene con ffmpeg).")
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "csv=p=0",
+            str(src),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or "ffprobe falló").strip())
+    try:
+        return float(result.stdout.strip())
+    except ValueError as exc:
+        raise RuntimeError("Duración de video no válida.") from exc
+
+
+def extract_preview_frame(src: str | Path, when: str | float = 0) -> bytes:
+    src = Path(src)
+    moment = parse_timestamp(when)
+    if not ffmpeg_available():
+        raise FFmpegNotFoundError(
+            "No se encontró ffmpeg. Instálalo y vuelve a intentarlo "
+            "(en Windows puedes usar https://ffmpeg.org/download.html)."
+        )
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-ss",
+        f"{moment:.3f}",
+        "-i",
+        str(src),
+        "-frames:v",
+        "1",
+        "-f",
+        "image2",
+        "-vcodec",
+        "mjpeg",
+        "pipe:1",
+    ]
+    result = subprocess.run(command, capture_output=True)
+    if result.returncode != 0 or not result.stdout:
+        detail = (result.stderr or b"no se pudo extraer el fotograma").decode("utf-8", "ignore").strip()
+        raise RuntimeError(detail.splitlines()[-1] if detail else "no se pudo extraer el fotograma")
+    return result.stdout
+
+
+ROTATIONS = {
+    "90": "transpose=1",
+    "180": "transpose=1,transpose=1",
+    "270": "transpose=2",
+    "hflip": "hflip",
+    "vflip": "vflip",
+}
+
+
+def rotate_video(
+    src: str | Path,
+    rotation: str = "90",
+    output_dir: str | Path | None = None,
+) -> Path:
+    if rotation not in ROTATIONS:
+        raise ValueError(f"Rotación no válida. Usa: {', '.join(ROTATIONS)}")
+    src = Path(src)
+    folder = Path(output_dir) if output_dir else src.parent
+    dest = unique_path(folder / f"{src.stem}_rotado.mp4")
+    vf = ROTATIONS[rotation]
+    try:
+        _run_ffmpeg(
+            [
+                "-i",
+                str(src),
+                "-vf",
+                vf,
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "20",
+                "-c:a",
+                "copy",
+                "-metadata:s:v:0",
+                "rotate=0",
+                str(dest),
+            ]
+        )
+    except RuntimeError:
+        if dest.exists():
+            dest.unlink()
+        _run_ffmpeg(
+            [
+                "-i",
+                str(src),
+                "-vf",
+                vf,
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "20",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-metadata:s:v:0",
+                "rotate=0",
+                str(dest),
+            ]
+        )
+    return dest
+
+
 def supported_output_extensions(kind: str) -> list[str]:
     if kind == "audio":
         return list(AUDIO_CODECS)

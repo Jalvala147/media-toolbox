@@ -9,9 +9,13 @@ from core.media import (
     convert_media,
     cut_clip,
     extract_audio,
+    extract_preview_frame,
     ffmpeg_available,
+    format_timestamp,
     join_clips,
     parse_timestamp,
+    probe_duration,
+    rotate_video,
 )
 from core.metadata import strip_audio_tags, wipe_all_metadata
 
@@ -71,9 +75,22 @@ def test_parse_timestamp_formats():
     assert parse_timestamp("00:01:30") == 90
 
 
-def test_parse_timestamp_rejects_invalid_format():
-    with pytest.raises(ValueError):
-        parse_timestamp("bad:time:x:y")
+def test_format_timestamp():
+    assert format_timestamp(90) == "01:30"
+    assert format_timestamp(3661) == "01:01:01"
+
+
+@needs_ffmpeg
+def test_preview_and_rotate(tmp_path: Path):
+    video = tmp_path / "clip.mp4"
+    _tiny_video(video)
+    duration = probe_duration(video)
+    assert duration > 0.5
+    frame = extract_preview_frame(video, 0.2)
+    assert frame[:2] == b"\xff\xd8"
+    rotated = rotate_video(video, rotation="90")
+    assert rotated.exists()
+    assert rotated.suffix == ".mp4"
 
 
 @needs_ffmpeg

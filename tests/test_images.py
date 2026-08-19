@@ -1,9 +1,10 @@
 from pathlib import Path
 
+import pytest
 from PIL import Image
 from PIL.ExifTags import Base as ExifBase
 
-from core.images import convert_image, resize_image, strip_image_metadata
+from core.images import HEIF_SUPPORTED, convert_heic_to_jpeg, convert_image, resize_image, strip_image_metadata
 from core.metadata import strip_metadata, wipe_all_metadata
 
 
@@ -50,6 +51,17 @@ def test_wipe_all_metadata_removes_exif(tmp_path: Path):
     assert dest.exists()
     assert Image.open(dest).getexif().get(ExifBase.Make) is None
     assert Image.open(src).getexif().get(ExifBase.Make) == "MediaToolboxTest"
+
+
+def test_convert_heic_to_jpeg(tmp_path: Path):
+    if not HEIF_SUPPORTED:
+        pytest.skip("pillow-heif no está disponible")
+    heic = tmp_path / "iphone.heic"
+    Image.new("RGB", (20, 10), "purple").save(heic, format="HEIF")
+    dest = convert_heic_to_jpeg(heic, quality=85)
+    assert dest.suffix == ".jpg"
+    assert dest.exists()
+    assert Image.open(dest).size == (20, 10)
 
 
 def test_strip_metadata_dispatcher_writes_copy(tmp_path: Path):
