@@ -15,7 +15,16 @@ Caja de herramientas de escritorio (Flet) para organizar y procesar fotos, audio
 
 Las herramientas de audio y video necesitan [ffmpeg](https://ffmpeg.org/download.html) en el PATH. HEIC necesita `pillow-heif`.
 
-## Cómo ejecutarlo
+## Instalar desde GitHub
+
+Como aplicación (recomendado):
+
+```bash
+python -m pip install "git+https://github.com/Jalvala147/media-toolbox.git"
+media-toolbox
+```
+
+O clonar y correr en desarrollo:
 
 ```bash
 python -m pip install -r requirements.txt
@@ -28,8 +37,30 @@ En Linux, el selector de archivos de Flet también necesita Zenity:
 sudo apt-get install zenity ffmpeg
 ```
 
-## Empaquetar (Windows)
+## Publicar un package / release
+
+Cada tag `vX.Y.Z` dispara GitHub Actions y publica:
+
+1. Un **GitHub Release** con el wheel de Python y (en Windows) `MediaToolbox.exe`
+2. El paquete pip en **GitHub Packages**
+
+```bash
+git tag v2.2.0
+git push origin v2.2.0
+```
+
+El resultado queda en [Releases](https://github.com/Jalvala147/media-toolbox/releases) y en [Packages](https://github.com/Jalvala147/media-toolbox/packages).
+
+Para instalar el package de GitHub Packages (pide autenticación):
+
+```bash
+python -m pip install media-toolbox --index-url https://pypi.pkg.github.com/Jalvala147/simple/
+```
+
+## Empaquetar en tu PC (Windows)
 
 ```bash
 pyinstaller main.spec
 ```
+
+El ejecutable sale en `dist/MediaToolbox.exe`.

@@ -1,0 +1,6 @@
+prune tests
+prune build
+prune dist
+exclude db.sql
+global-exclude *.pyc
+global-exclude __pycache__

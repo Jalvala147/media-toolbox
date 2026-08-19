@@ -1,12 +1,25 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-
 a = Analysis(
-    ['main.py'],
+    ["main.py"],
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=[],
+    hiddenimports=[
+        "app",
+        "core",
+        "core.files",
+        "core.images",
+        "core.media",
+        "core.metadata",
+        "core.organize",
+        "core.rename",
+        "core.zip_files",
+        "PIL",
+        "mutagen",
+        "pillow_heif",
+        "flet",
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -22,7 +35,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='main',
+    name="MediaToolbox",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -35,5 +48,4 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    version='C:\\Users\\Jalva\\AppData\\Local\\Temp\\84146d7f-686d-4184-aad1-43e7eed200a7',
 )

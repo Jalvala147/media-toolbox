@@ -10,3 +10,5 @@ build/
 dist/
 *.spec.bak
 .DS_Store
+media_toolbox.egg-info/
+
