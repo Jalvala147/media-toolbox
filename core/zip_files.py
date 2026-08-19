@@ -1,11 +1,13 @@
 # core/zip_files.py
 
 import io
-import zipfile, os
+import os
+import zipfile
 
-def rename_and_zip(files_data, new_name, extension_filter=None):
+
+def rename_and_zip(files_data, new_name, extension_filter=None, padding=3, start=1):
     zip_buffer = io.BytesIO()
-    counter = 1
+    counter = start
 
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
         for file_data in files_data:
@@ -16,7 +18,7 @@ def rename_and_zip(files_data, new_name, extension_filter=None):
             if extension_filter and file_extension.lower() != extension_filter.lower():
                 continue
 
-            new_file_name = f"{new_name}_{counter:03}{file_extension}"
+            new_file_name = f"{new_name}_{str(counter).zfill(padding)}{file_extension}"
             zip_file.writestr(new_file_name, file_bytes)
             counter += 1
 
