@@ -6,7 +6,15 @@ from pathlib import Path
 
 from PIL import Image
 
-from core.files import IMAGE_EXTS
+from core.files import HEIC_EXTS, unique_path
+
+try:
+    from pillow_heif import register_heif_opener
+
+    register_heif_opener()
+    HEIF_SUPPORTED = True
+except Exception:
+    HEIF_SUPPORTED = False
 
 _FORMAT_BY_EXT = {
     ".jpg": "JPEG",
@@ -21,14 +29,7 @@ _FORMAT_BY_EXT = {
 
 
 def _unique_path(path: Path) -> Path:
-    if not path.exists():
-        return path
-    index = 2
-    while True:
-        candidate = path.with_name(f"{path.stem}_{index}{path.suffix}")
-        if not candidate.exists():
-            return candidate
-        index += 1
+    return unique_path(path)
 
 
 def _open_still_image(src: Path) -> Image.Image:
@@ -125,7 +126,7 @@ def convert_image(
     ext = dest_ext.lower()
     if not ext.startswith("."):
         ext = f".{ext}"
-    if ext not in IMAGE_EXTS:
+    if ext not in _FORMAT_BY_EXT:
         raise ValueError(f"Extensión de imagen no soportada: {ext}")
     fmt = _FORMAT_BY_EXT[ext]
     dest = Path(dest) if dest else src.with_suffix(ext)
@@ -133,6 +134,23 @@ def convert_image(
         work = _prepare_for_format(image.copy(), fmt)
         _save_image(work, dest, fmt, quality=quality)
     return dest
+
+
+def convert_heic_to_jpeg(
+    src: str | Path,
+    *,
+    dest: str | Path | None = None,
+    quality: int = 90,
+) -> Path:
+    src = Path(src)
+    if src.suffix.lower() not in HEIC_EXTS:
+        raise ValueError(f"No es un archivo HEIC/HEIF: {src.name}")
+    if not HEIF_SUPPORTED:
+        raise RuntimeError(
+            "Falta pillow-heif para leer HEIC. Instálalo con: pip install pillow-heif"
+        )
+    dest = Path(dest) if dest else _unique_path(src.with_suffix(".jpg"))
+    return convert_image(src, ".jpg", dest=dest, quality=quality)
 
 
 def output_image_path(src: Path, suffix_label: str, output_dir: str | Path | None = None, new_ext: str | None = None) -> Path:

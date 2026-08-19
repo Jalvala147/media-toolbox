@@ -9,13 +9,26 @@ from pathlib import Path
 
 import flet as ft
 
-from core.files import AUDIO_EXTS, IMAGE_EXTS, VIDEO_EXTS, collect_files, normalize_extension
-from core.images import convert_image, output_image_path, resize_image
-from core.media import convert_media, extract_audio, ffmpeg_available
-from core.metadata import strip_metadata
+from core.files import AUDIO_EXTS, HEIC_EXTS, IMAGE_EXTS, VIDEO_EXTS, collect_files, normalize_extension
+from core.images import convert_heic_to_jpeg, convert_image, output_image_path, resize_image
+from core.media import (
+    compress_for_whatsapp,
+    convert_media,
+    cut_clip,
+    extract_audio,
+    extract_preview_frame,
+    ffmpeg_available,
+    format_timestamp,
+    join_clips,
+    parse_timestamp,
+    probe_duration,
+    rotate_video,
+)
+from core.metadata import wipe_all_metadata
+from core.organize import apply_organize_plan, build_organize_plan
 from core.rename import apply_rename_plan, build_rename_plan, undo_rename_plan
 
-VERSION = "2.0"
+VERSION = "2.2"
 CYAN = ft.Colors.CYAN_400
 CARD_BG = "#111827"
 PAGE_BG = "#0b1220"
@@ -172,10 +185,40 @@ class MediaToolboxApp:
                 self.show_rename,
             ),
             self._home_card(
-                "Limpiar metadatos",
-                "Quita EXIF y etiquetas de foto, audio y video",
-                ft.Icons.CLEANING_SERVICES,
+                "Borrar toda la metadata",
+                "Quita EXIF, GPS, etiquetas y capítulos",
+                ft.Icons.DELETE_SWEEP,
                 self.show_metadata,
+            ),
+            self._home_card(
+                "Cortar / unir video",
+                "Recorta con vista previa o junta varios clips",
+                ft.Icons.CONTENT_CUT,
+                self.show_cut_join,
+            ),
+            self._home_card(
+                "Girar video",
+                "Rota 90/180° o voltea horizontal y vertical",
+                ft.Icons.SCREEN_ROTATION,
+                self.show_rotate,
+            ),
+            self._home_card(
+                "HEIC a JPG",
+                "Convierte fotos de iPhone a JPG",
+                ft.Icons.HEVC,
+                self.show_heic,
+            ),
+            self._home_card(
+                "Comprimir para WhatsApp",
+                "MP4 liviano en 720p o 480p, listo para enviar",
+                ft.Icons.CHAT,
+                self.show_whatsapp,
+            ),
+            self._home_card(
+                "Organizar por fecha",
+                "Carpetas YYYY/MM según EXIF o fecha del archivo",
+                ft.Icons.DATE_RANGE,
+                self.show_organize,
             ),
             self._home_card(
                 "Extraer audio",
@@ -289,12 +332,19 @@ class MediaToolboxApp:
             )
         return summary, ft.Row(buttons, wrap=True, spacing=10)
 
-    def gather_files(self, allowed: set[str] | None = None, extension_filter: str | None = None, recursive: bool = False) -> list[Path]:
+    def gather_files(
+        self,
+        allowed: set[str] | None = None,
+        extension_filter: str | None = None,
+        recursive: bool = False,
+        sort: bool = True,
+    ) -> list[Path]:
         return collect_files(
             self.selected,
             allowed_extensions=allowed,
             extension_filter=extension_filter,
             recursive=recursive,
+            sort=sort,
         )
 
     def show_rename(self) -> None:
@@ -510,20 +560,20 @@ class MediaToolboxApp:
             files = self.gather_files(IMAGE_EXTS | AUDIO_EXTS | VIDEO_EXTS, recursive=bool(recursive.value))
             self._run_batch(
                 files,
-                lambda path: strip_metadata(path, overwrite=bool(overwrite.value)),
+                lambda path: wipe_all_metadata(path, overwrite=bool(overwrite.value)),
                 empty="No hay imágenes, audio o video en la selección.",
-                done_label="Metadatos limpiados",
+                done_label="Metadata borrada",
             )
 
         self.set_view(
             self.tool_scaffold(
-                "Limpiar metadatos",
-                "Elimina EXIF de fotos y etiquetas de audio/video. Por defecto guarda una copia.",
+                "Borrar toda la metadata",
+                "Elimina EXIF, GPS, etiquetas ID3, capítulos y metadatos de contenedor. Por defecto guarda una copia.",
                 [
                     summary,
                     buttons,
                     ft.Row([overwrite, recursive], wrap=True),
-                    ft.FilledButton("Limpiar metadatos", icon=ft.Icons.CLEANING_SERVICES, on_click=run),
+                    ft.FilledButton("Borrar toda la metadata", icon=ft.Icons.DELETE_SWEEP, on_click=run),
                     preview,
                 ],
             )
@@ -696,7 +746,8 @@ class MediaToolboxApp:
         async def pick_files(e=None):
             files = await self.picker.pick_files(
                 allow_multiple=True,
-                file_type=ft.FilePickerFileType.IMAGE,
+                file_type=ft.FilePickerFileType.CUSTOM,
+                allowed_extensions=[ext.lstrip(".") for ext in sorted(IMAGE_EXTS)],
             )
             if files:
                 self.selected = [f.path for f in files if f.path]
@@ -720,6 +771,8 @@ class MediaToolboxApp:
             height = parse_int(height_input.value, 1080)
             quality = parse_int(quality_input.value, 85)
             target_ext = None if fmt.value in (None, "same") else fmt.value
+            if target_ext is None and path.suffix.lower() in HEIC_EXTS:
+                target_ext = ".jpg"
             if overwrite.value:
                 dest = path.with_suffix(target_ext or path.suffix)
             else:
@@ -763,6 +816,481 @@ class MediaToolboxApp:
                 ],
             )
         )
+
+    def show_cut_join(self) -> None:
+        self.selected = []
+        self.status.value = ""
+        start_input = ft.TextField(label="Inicio", hint_text="00:00:05", value="0", width=160)
+        end_input = ft.TextField(label="Fin (vacío = hasta el final)", hint_text="00:00:20", width=220)
+        summary, buttons = self._selection_row("both", [ext.lstrip(".") for ext in VIDEO_EXTS])
+        duration_text = ft.Text("", size=13, color=MUTED)
+        start_img = ft.Image(src="", width=260, height=150, fit=ft.BoxFit.CONTAIN, border_radius=12, visible=False)
+        end_img = ft.Image(src="", width=260, height=150, fit=ft.BoxFit.CONTAIN, border_radius=12, visible=False)
+        start_caption = ft.Text("Inicio", size=12, color=MUTED)
+        end_caption = ft.Text("Fin", size=12, color=MUTED)
+        file_preview = ft.Column()
+
+        def refresh_list(e=None):
+            files = self.gather_files(VIDEO_EXTS, sort=False)
+            file_preview.controls = [self.file_list(files)]
+            self.page.update()
+
+        def refresh_frames(e=None):
+            files = self.gather_files(VIDEO_EXTS, sort=False)
+            refresh_list()
+            if not files:
+                duration_text.value = "Selecciona un video para ver la vista previa."
+                start_img.visible = False
+                end_img.visible = False
+                self.page.update()
+                return
+            if not ffmpeg_available():
+                duration_text.value = "Instala ffmpeg para ver fotogramas de inicio y fin."
+                self.page.update()
+                return
+            video = files[0]
+            try:
+                duration = probe_duration(video)
+                start_s = parse_timestamp(start_input.value or 0)
+                end_raw = (end_input.value or "").strip()
+                end_s = parse_timestamp(end_raw) if end_raw else max(duration - 0.04, 0)
+                if start_s > duration:
+                    start_s = max(duration - 0.04, 0)
+                if end_s > duration:
+                    end_s = duration
+                start_img.src = extract_preview_frame(video, start_s)
+                end_img.src = extract_preview_frame(video, end_s)
+                start_img.visible = True
+                end_img.visible = True
+                extra = f"  ·  {len(files)} videos" if len(files) > 1 else ""
+                duration_text.value = (
+                    f"{video.name}  ·  duración {format_timestamp(duration)} "
+                    f"({duration:.1f}s){extra}"
+                )
+            except Exception as err:
+                duration_text.value = f"No se pudo generar la vista previa: {err}"
+                start_img.visible = False
+                end_img.visible = False
+            self.page.update()
+
+        async def pick_files(e=None):
+            files = await self.picker.pick_files(
+                allow_multiple=True,
+                file_type=ft.FilePickerFileType.CUSTOM,
+                allowed_extensions=[ext.lstrip(".") for ext in sorted(VIDEO_EXTS)],
+            )
+            if files:
+                self.selected = [f.path for f in files if f.path]
+                summary.value = self.selected_label()
+                refresh_frames()
+
+        async def pick_folder(e=None):
+            path = await self.picker.get_directory_path()
+            if path:
+                self.selected = [path]
+                summary.value = self.selected_label()
+                refresh_frames()
+
+        buttons.controls = [
+            ft.FilledButton("Archivos", icon=ft.Icons.INSERT_DRIVE_FILE, on_click=pick_files),
+            ft.OutlinedButton("Carpeta", icon=ft.Icons.FOLDER_OPEN, on_click=pick_folder),
+        ]
+        start_input.on_blur = refresh_frames
+        end_input.on_blur = refresh_frames
+
+        def require_ffmpeg() -> bool:
+            if ffmpeg_available():
+                return True
+            self.notify("Necesitas ffmpeg instalado para cortar o unir video.", error=True)
+            return False
+
+        def run_cut(e=None):
+            if not require_ffmpeg():
+                return
+            files = self.gather_files(VIDEO_EXTS, sort=False)
+            end_value = (end_input.value or "").strip() or None
+            self._run_batch(
+                files,
+                lambda path: cut_clip(path, start=start_input.value or "0", end=end_value),
+                empty="Selecciona videos para cortar.",
+                done_label="Videos cortados",
+            )
+
+        def run_join(e=None):
+            if not require_ffmpeg():
+                return
+            files = self.gather_files(VIDEO_EXTS, sort=False)
+            if len(files) < 2:
+                self.notify("Selecciona al menos dos videos para unir.", error=True)
+                return
+            if self._busy:
+                return
+            self.set_busy(True, 0, 1)
+            try:
+                dest = join_clips(files)
+                self.notify(f"Video unido: {dest.name}")
+                open_path(dest.parent)
+            except Exception as err:
+                self.notify(f"Error: {err}", error=True)
+            finally:
+                self.set_busy(False, 1, 1)
+
+        duration_text.value = "Selecciona un video para ver la vista previa."
+        self.set_view(
+            self.tool_scaffold(
+                "Cortar / unir video",
+                "Corta un fragmento viendo el fotograma de inicio y fin, o une los videos en el orden de selección.",
+                [
+                    summary,
+                    buttons,
+                    ft.Row([start_input, end_input], wrap=True, spacing=12),
+                    duration_text,
+                    ft.Row(
+                        [
+                            ft.Column([start_caption, start_img], spacing=6, horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+                            ft.Column([end_caption, end_img], spacing=6, horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+                        ],
+                        wrap=True,
+                        spacing=16,
+                    ),
+                    ft.Row(
+                        [
+                            ft.FilledButton("Cortar", icon=ft.Icons.CONTENT_CUT, on_click=run_cut),
+                            ft.OutlinedButton("Unir seleccionados", icon=ft.Icons.MERGE, on_click=run_join),
+                            ft.TextButton("Actualizar vista previa", icon=ft.Icons.IMAGE_SEARCH, on_click=refresh_frames),
+                        ],
+                        wrap=True,
+                    ),
+                    file_preview,
+                ],
+            )
+        )
+
+    def show_rotate(self) -> None:
+        self.selected = []
+        self.status.value = ""
+        rotation = ft.Dropdown(
+            label="Girar / voltear",
+            value="90",
+            options=[
+                ft.DropdownOption(key="90", text="90° a la derecha"),
+                ft.DropdownOption(key="270", text="90° a la izquierda"),
+                ft.DropdownOption(key="180", text="180°"),
+                ft.DropdownOption(key="hflip", text="Voltear horizontal"),
+                ft.DropdownOption(key="vflip", text="Voltear vertical"),
+            ],
+            width=280,
+        )
+        summary, buttons = self._selection_row("both", [ext.lstrip(".") for ext in VIDEO_EXTS])
+        preview = ft.Column()
+
+        def refresh(e=None):
+            files = self.gather_files(VIDEO_EXTS)
+            preview.controls = [self.file_list(files)]
+            self.page.update()
+
+        async def pick_files(e=None):
+            files = await self.picker.pick_files(
+                allow_multiple=True,
+                file_type=ft.FilePickerFileType.CUSTOM,
+                allowed_extensions=[ext.lstrip(".") for ext in sorted(VIDEO_EXTS)],
+            )
+            if files:
+                self.selected = [f.path for f in files if f.path]
+                summary.value = self.selected_label()
+                refresh()
+
+        async def pick_folder(e=None):
+            path = await self.picker.get_directory_path()
+            if path:
+                self.selected = [path]
+                summary.value = self.selected_label()
+                refresh()
+
+        buttons.controls = [
+            ft.FilledButton("Archivos", icon=ft.Icons.INSERT_DRIVE_FILE, on_click=pick_files),
+            ft.OutlinedButton("Carpeta", icon=ft.Icons.FOLDER_OPEN, on_click=pick_folder),
+        ]
+
+        def run(e=None):
+            if not ffmpeg_available():
+                self.notify("Necesitas ffmpeg instalado para girar video.", error=True)
+                return
+            files = self.gather_files(VIDEO_EXTS)
+            self._run_batch(
+                files,
+                lambda path: rotate_video(path, rotation=rotation.value or "90"),
+                empty="Selecciona videos para girar.",
+                done_label="Videos girados",
+            )
+
+        self.set_view(
+            self.tool_scaffold(
+                "Girar video",
+                "Útil para clips grabados con el celular. El original no se borra.",
+                [
+                    summary,
+                    buttons,
+                    rotation,
+                    ft.FilledButton("Girar", icon=ft.Icons.SCREEN_ROTATION, on_click=run),
+                    preview,
+                ],
+            )
+        )
+
+    def show_heic(self) -> None:
+        self.selected = []
+        self.status.value = ""
+        quality_input = ft.TextField(label="Calidad JPG (1-100)", value="90", width=180)
+        summary, buttons = self._selection_row("both", [ext.lstrip(".") for ext in HEIC_EXTS])
+        preview = ft.Column()
+
+        def refresh(e=None):
+            files = self.gather_files(HEIC_EXTS)
+            preview.controls = [self.file_list(files)]
+            self.page.update()
+
+        async def pick_files(e=None):
+            files = await self.picker.pick_files(
+                allow_multiple=True,
+                file_type=ft.FilePickerFileType.CUSTOM,
+                allowed_extensions=[ext.lstrip(".") for ext in sorted(HEIC_EXTS)],
+            )
+            if files:
+                self.selected = [f.path for f in files if f.path]
+                summary.value = self.selected_label()
+                refresh()
+
+        async def pick_folder(e=None):
+            path = await self.picker.get_directory_path()
+            if path:
+                self.selected = [path]
+                summary.value = self.selected_label()
+                refresh()
+
+        buttons.controls = [
+            ft.FilledButton("Archivos", icon=ft.Icons.INSERT_DRIVE_FILE, on_click=pick_files),
+            ft.OutlinedButton("Carpeta", icon=ft.Icons.FOLDER_OPEN, on_click=pick_folder),
+        ]
+
+        def run(e=None):
+            files = self.gather_files(HEIC_EXTS)
+            quality = parse_int(quality_input.value, 90)
+            self._run_batch(
+                files,
+                lambda path: convert_heic_to_jpeg(path, quality=quality),
+                empty="Selecciona fotos HEIC/HEIF (típico de iPhone).",
+                done_label="Convertidos a JPG",
+            )
+
+        self.set_view(
+            self.tool_scaffold(
+                "HEIC a JPG",
+                "Convierte las fotos de iPhone a JPG, dejando el HEIC original.",
+                [
+                    summary,
+                    buttons,
+                    quality_input,
+                    ft.FilledButton("Convertir a JPG", icon=ft.Icons.HEVC, on_click=run),
+                    preview,
+                ],
+            )
+        )
+
+    def show_whatsapp(self) -> None:
+        self.selected = []
+        self.status.value = ""
+        preset = ft.Dropdown(
+            label="Calidad",
+            value="720p",
+            options=[
+                ft.DropdownOption(key="720p", text="720p (mejor calidad)"),
+                ft.DropdownOption(key="480p", text="480p (más liviano)"),
+            ],
+            width=260,
+        )
+        summary, buttons = self._selection_row("both", [ext.lstrip(".") for ext in VIDEO_EXTS])
+        preview = ft.Column()
+
+        def refresh(e=None):
+            files = self.gather_files(VIDEO_EXTS)
+            preview.controls = [self.file_list(files)]
+            self.page.update()
+
+        async def pick_files(e=None):
+            files = await self.picker.pick_files(
+                allow_multiple=True,
+                file_type=ft.FilePickerFileType.CUSTOM,
+                allowed_extensions=[ext.lstrip(".") for ext in sorted(VIDEO_EXTS)],
+            )
+            if files:
+                self.selected = [f.path for f in files if f.path]
+                summary.value = self.selected_label()
+                refresh()
+
+        async def pick_folder(e=None):
+            path = await self.picker.get_directory_path()
+            if path:
+                self.selected = [path]
+                summary.value = self.selected_label()
+                refresh()
+
+        buttons.controls = [
+            ft.FilledButton("Archivos", icon=ft.Icons.INSERT_DRIVE_FILE, on_click=pick_files),
+            ft.OutlinedButton("Carpeta", icon=ft.Icons.FOLDER_OPEN, on_click=pick_folder),
+        ]
+
+        def run(e=None):
+            if not ffmpeg_available():
+                self.notify("Necesitas ffmpeg instalado para comprimir video.", error=True)
+                return
+            files = self.gather_files(VIDEO_EXTS)
+            self._run_batch(
+                files,
+                lambda path: compress_for_whatsapp(path, preset=preset.value or "720p"),
+                empty="Selecciona videos para comprimir.",
+                done_label="Videos listos para WhatsApp",
+            )
+
+        self.set_view(
+            self.tool_scaffold(
+                "Comprimir para WhatsApp",
+                "Crea un MP4 H.264 liviano (yuv420p + AAC) sin tocar el original.",
+                [
+                    summary,
+                    buttons,
+                    preset,
+                    ft.FilledButton("Comprimir", icon=ft.Icons.CHAT, on_click=run),
+                    preview,
+                ],
+            )
+        )
+
+    def show_organize(self) -> None:
+        self.selected = []
+        self.status.value = ""
+        layout = ft.Dropdown(
+            label="Carpetas",
+            value="year_month",
+            options=[
+                ft.DropdownOption(key="year_month", text="Año / mes  (2024/08)"),
+                ft.DropdownOption(key="year_month_day", text="Año / mes / día"),
+            ],
+            expand=True,
+        )
+        move = ft.Checkbox(label="Mover (en vez de copiar)", value=False)
+        recursive = ft.Checkbox(label="Incluir subcarpetas", value=True)
+        dest_label = ft.Text("Carpeta destino: la misma de origen", size=13, color=MUTED, selectable=True)
+        dest_folder: list[str] = []
+        summary, buttons = self._selection_row("both")
+        preview_box = ft.Column()
+
+        def source_root() -> Path | None:
+            if not self.selected:
+                return None
+            path = Path(self.selected[0])
+            return path if path.is_dir() else path.parent
+
+        def dest_root() -> Path | None:
+            if dest_folder:
+                return Path(dest_folder[0])
+            return source_root()
+
+        def refresh(e=None):
+            preview_box.controls.clear()
+            files = self.gather_files(recursive=bool(recursive.value))
+            root = dest_root()
+            if not files or root is None:
+                preview_box.controls.append(ft.Text("Selecciona archivos o una carpeta para ver el destino.", color=MUTED))
+                self.page.update()
+                return
+            try:
+                plan = build_organize_plan(files, root, layout=layout.value or "year_month")
+                preview_box.controls.append(
+                    ft.Text(f"{len(plan)} archivos → {root}", color=CYAN, weight=ft.FontWeight.BOLD)
+                )
+                for item in plan[:30]:
+                    relative = item.destination.relative_to(root)
+                    preview_box.controls.append(
+                        ft.Text(
+                            f"{item.source.name}  →  {relative}  ({item.taken_at:%Y-%m-%d})",
+                            size=12,
+                            color=ft.Colors.WHITE70,
+                        )
+                    )
+                if len(plan) > 30:
+                    preview_box.controls.append(ft.Text(f"… y {len(plan) - 30} más", color=MUTED, size=12))
+            except Exception as err:
+                preview_box.controls.append(ft.Text(str(err), color=ft.Colors.RED_400))
+            self.page.update()
+
+        recursive.on_change = refresh
+        layout.on_select = refresh
+
+        async def pick_files(e=None):
+            files = await self.picker.pick_files(allow_multiple=True)
+            if files:
+                self.selected = [f.path for f in files if f.path]
+                summary.value = self.selected_label()
+                refresh()
+
+        async def pick_folder(e=None):
+            path = await self.picker.get_directory_path(dialog_title="Carpeta de origen")
+            if path:
+                self.selected = [path]
+                summary.value = self.selected_label()
+                refresh()
+
+        async def pick_dest(e=None):
+            path = await self.picker.get_directory_path(dialog_title="Carpeta destino")
+            if path:
+                dest_folder.clear()
+                dest_folder.append(path)
+                dest_label.value = f"Carpeta destino: {path}"
+                refresh()
+
+        buttons.controls = [
+            ft.FilledButton("Archivos", icon=ft.Icons.INSERT_DRIVE_FILE, on_click=pick_files),
+            ft.OutlinedButton("Carpeta origen", icon=ft.Icons.FOLDER_OPEN, on_click=pick_folder),
+            ft.TextButton("Elegir destino", icon=ft.Icons.DRIVE_FILE_MOVE, on_click=pick_dest),
+        ]
+
+        def run(e=None):
+            files = self.gather_files(recursive=bool(recursive.value))
+            root = dest_root()
+            if not files or root is None:
+                self.notify("Selecciona archivos y una carpeta destino.", error=True)
+                return
+            try:
+                plan = build_organize_plan(files, root, layout=layout.value or "year_month")
+                count = apply_organize_plan(plan, move=bool(move.value))
+                self.notify(f"Organizados {count} archivos en {root}")
+                open_path(root)
+                refresh()
+            except Exception as err:
+                self.notify(f"Error: {err}", error=True)
+
+        self.set_view(
+            self.tool_scaffold(
+                "Organizar por fecha",
+                "Usa la fecha de la foto (EXIF) si existe; si no, la fecha de modificación del archivo.",
+                [
+                    summary,
+                    buttons,
+                    dest_label,
+                    ft.Row([layout, move, recursive], wrap=True, spacing=12),
+                    ft.Row(
+                        [
+                            ft.FilledButton("Organizar", icon=ft.Icons.DATE_RANGE, on_click=run),
+                            ft.TextButton("Vista previa", on_click=refresh),
+                        ],
+                        wrap=True,
+                    ),
+                    ft.Container(bgcolor=CARD_BG, border_radius=12, padding=16, content=preview_box),
+                ],
+            )
+        )
+        preview_box.controls.append(ft.Text("Selecciona archivos o una carpeta para ver el destino.", color=MUTED))
 
     def _run_batch(self, files: list[Path], worker, *, empty: str, done_label: str) -> None:
         if self._busy:
