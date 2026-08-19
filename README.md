@@ -17,12 +17,14 @@ Las herramientas de audio y video necesitan [ffmpeg](https://ffmpeg.org/download
 
 ## Instalar desde GitHub
 
-Como aplicación (recomendado):
+Como paquete de Python:
 
 ```bash
 python -m pip install "git+https://github.com/Jalvala147/media-toolbox.git"
 media-toolbox
 ```
+
+Los instaladores y wheels también salen en [Releases](https://github.com/Jalvala147/media-toolbox/releases).
 
 O clonar y correr en desarrollo:
 
@@ -39,22 +41,14 @@ sudo apt-get install zenity ffmpeg
 
 ## Publicar un package / release
 
-Cada tag `vX.Y.Z` dispara GitHub Actions y publica:
+Cada tag `vX.Y.Z` dispara GitHub Actions y crea un **GitHub Release** con:
 
-1. Un **GitHub Release** con el wheel de Python y (en Windows) `MediaToolbox.exe`
-2. El paquete pip en **GitHub Packages**
+- el wheel / sdist de Python (`pip install ...`)
+- `MediaToolbox.exe` (build de Windows)
 
 ```bash
 git tag v2.2.0
 git push origin v2.2.0
-```
-
-El resultado queda en [Releases](https://github.com/Jalvala147/media-toolbox/releases) y en [Packages](https://github.com/Jalvala147/media-toolbox/packages).
-
-Para instalar el package de GitHub Packages (pide autenticación):
-
-```bash
-python -m pip install media-toolbox --index-url https://pypi.pkg.github.com/Jalvala147/simple/
 ```
 
 ## Empaquetar en tu PC (Windows)
