@@ -19,12 +19,25 @@ def normalize_extension(extension_filter: str | None) -> str | None:
     return ext if ext.startswith(".") else f".{ext}"
 
 
+def unique_path(path: str | Path) -> Path:
+    path = Path(path)
+    if not path.exists():
+        return path
+    index = 2
+    while True:
+        candidate = path.with_name(f"{path.stem}_{index}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+        index += 1
+
+
 def collect_files(
-    paths: list[str] | str,
+    paths: list[str] | str | Path,
     *,
     allowed_extensions: set[str] | None = None,
     extension_filter: str | None = None,
     recursive: bool = False,
+    sort: bool = True,
 ) -> list[Path]:
     """Devuelve archivos regulares a partir de carpetas y/o rutas de archivo."""
     if isinstance(paths, (str, Path)):
@@ -58,5 +71,6 @@ def collect_files(
             seen.add(resolved)
             found.append(candidate)
 
-    found.sort(key=lambda p: p.name.lower())
+    if sort:
+        found.sort(key=lambda p: p.name.lower())
     return found

@@ -38,24 +38,44 @@ def strip_metadata(
     *,
     overwrite: bool = False,
     output_dir: str | Path | None = None,
+    deep: bool = False,
 ) -> Path:
     src = Path(src)
     suffix = src.suffix.lower()
+    label = "_sin_metadatos"
 
     if suffix in IMAGE_EXTS:
-        dest = src if overwrite else output_image_path(src, "_sin_metadatos", output_dir)
+        dest = src if overwrite else output_image_path(src, label, output_dir)
         return strip_image_metadata(src, dest)
 
     if suffix in AUDIO_EXTS:
-        dest = src if overwrite else _unique_copy(src, "_sin_metadatos", output_dir)
+        dest = src if overwrite else _unique_copy(src, label, output_dir)
         try:
-            return strip_audio_tags(dest)
+            strip_audio_tags(dest)
         except Exception:
             if dest != src and dest.exists():
                 dest.unlink()
-            return strip_av_metadata(src, overwrite=overwrite, output_dir=output_dir)
+            dest = strip_av_metadata(src, overwrite=overwrite, output_dir=output_dir, deep=deep)
+        else:
+            if deep:
+                dest = strip_av_metadata(dest, overwrite=True, deep=True)
+                try:
+                    strip_audio_tags(dest)
+                except Exception:
+                    pass
+        return dest
 
     if suffix in VIDEO_EXTS:
-        return strip_av_metadata(src, overwrite=overwrite, output_dir=output_dir)
+        return strip_av_metadata(src, overwrite=overwrite, output_dir=output_dir, deep=deep)
 
     raise ValueError(f"Tipo de archivo no soportado: {src.name}")
+
+
+def wipe_all_metadata(
+    src: str | Path,
+    *,
+    overwrite: bool = False,
+    output_dir: str | Path | None = None,
+) -> Path:
+    """Borra EXIF, GPS, etiquetas, capítulos y metadatos de contenedor."""
+    return strip_metadata(src, overwrite=overwrite, output_dir=output_dir, deep=True)

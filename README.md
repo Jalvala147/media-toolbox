@@ -2,10 +2,13 @@
 
 Caja de herramientas de escritorio (Flet) para organizar y procesar fotos, audio y video.
 
-## Qué incluye (v2.0)
+## Qué incluye (v2.1)
 
 - **Renombrar archivos** por lote, con vista previa, numeración, patrones y deshacer.
-- **Limpiar metadatos** (EXIF de imágenes y etiquetas de audio/video).
+- **Borrar toda la metadata** (EXIF, GPS, etiquetas, capítulos y metadatos de contenedor).
+- **Cortar / unir video** por tiempo o en el orden de selección.
+- **Comprimir para WhatsApp** (MP4 720p o 480p).
+- **Organizar por fecha** en carpetas `Año/Mes` (usa EXIF si existe).
 - **Extraer audio** de un video (MP3, WAV, M4A, OGG, FLAC).
 - **Convertir** video y audio a otro formato.
 - **Imágenes**: redimensionar, comprimir y convertir JPG/PNG/WebP/BMP.

@@ -6,7 +6,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from core.files import AUDIO_EXTS, VIDEO_EXTS
+from core.files import AUDIO_EXTS, VIDEO_EXTS, unique_path
 
 AUDIO_CODECS = {
     ".mp3": ["-c:a", "libmp3lame", "-q:a", "2"],
@@ -47,15 +47,10 @@ def _run_ffmpeg(args: list[str]) -> None:
         raise RuntimeError(detail.splitlines()[-1] if detail else "ffmpeg falló")
 
 
-def _unique_path(path: Path) -> Path:
-    if not path.exists():
-        return path
-    index = 2
-    while True:
-        candidate = path.with_name(f"{path.stem}_{index}{path.suffix}")
-        if not candidate.exists():
-            return candidate
-        index += 1
+WHATSAPP_PRESETS = {
+    "720p": {"max_w": 1280, "max_h": 720, "crf": 26, "audio_k": 96, "fps": 30},
+    "480p": {"max_w": 854, "max_h": 480, "crf": 28, "audio_k": 64, "fps": 24},
+}
 
 
 def _normalize_ext(ext: str) -> str:
@@ -73,7 +68,7 @@ def extract_audio(
     if ext not in AUDIO_CODECS:
         raise ValueError(f"Formato de audio no soportado: {ext}")
     folder = Path(output_dir) if output_dir else src.parent
-    dest = _unique_path(folder / f"{src.stem}{ext}")
+    dest = unique_path(folder / f"{src.stem}{ext}")
     _run_ffmpeg(["-i", str(src), "-vn", *AUDIO_CODECS[ext], str(dest)])
     return dest
 
@@ -86,7 +81,7 @@ def convert_media(
     src = Path(src)
     ext = _normalize_ext(dest_ext)
     folder = Path(output_dir) if output_dir else src.parent
-    dest = _unique_path(folder / f"{src.stem}{ext}")
+    dest = unique_path(folder / f"{src.stem}{ext}")
 
     if ext in AUDIO_CODECS:
         args = ["-i", str(src), "-vn", *AUDIO_CODECS[ext], str(dest)]
@@ -98,23 +93,173 @@ def convert_media(
     return dest
 
 
-def strip_av_metadata(src: str | Path, overwrite: bool = False, output_dir: str | Path | None = None) -> Path:
+def parse_timestamp(value: str | float | int) -> float:
+    """Convierte '90', '1:30' o '00:01:30' a segundos."""
+    if isinstance(value, (int, float)):
+        seconds = float(value)
+        if seconds < 0:
+            raise ValueError("El tiempo no puede ser negativo.")
+        return seconds
+    text = str(value).strip().replace(",", ".")
+    if not text:
+        raise ValueError("El tiempo está vacío.")
+    parts = text.split(":")
+    try:
+        if len(parts) == 1:
+            seconds = float(parts[0])
+        elif len(parts) == 2:
+            seconds = int(parts[0]) * 60 + float(parts[1])
+        elif len(parts) == 3:
+            seconds = int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+        else:
+            raise ValueError
+    except ValueError as exc:
+        raise ValueError("Usa segundos o un formato como 00:01:30.") from exc
+    if seconds < 0:
+        raise ValueError("El tiempo no puede ser negativo.")
+    return seconds
+
+
+def cut_clip(
+    src: str | Path,
+    start: str | float = 0,
+    end: str | float | None = None,
+    output_dir: str | Path | None = None,
+) -> Path:
+    src = Path(src)
+    start_s = parse_timestamp(start)
+    folder = Path(output_dir) if output_dir else src.parent
+    dest = unique_path(folder / f"{src.stem}_corte{src.suffix}")
+    args = ["-i", str(src), "-ss", f"{start_s:.3f}"]
+    if end is not None and str(end).strip() != "":
+        end_s = parse_timestamp(end)
+        if end_s <= start_s:
+            raise ValueError("El tiempo final debe ser mayor que el inicial.")
+        args += ["-to", f"{end_s:.3f}"]
+    args += ["-map_metadata", "-1", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-c:a", "aac", "-b:a", "128k", str(dest)]
+    _run_ffmpeg(args)
+    return dest
+
+
+def join_clips(sources: list[str | Path], output_dir: str | Path | None = None) -> Path:
+    clips = [Path(item) for item in sources]
+    if len(clips) < 2:
+        raise ValueError("Selecciona al menos dos videos para unir.")
+    folder = Path(output_dir) if output_dir else clips[0].parent
+    dest = unique_path(folder / f"{clips[0].stem}_unido.mp4")
+    list_file = unique_path(folder / f".{clips[0].stem}_concat.txt")
+    lines = []
+    for clip in clips:
+        escaped = clip.resolve().as_posix().replace("'", r"'\''")
+        lines.append(f"file '{escaped}'")
+    list_file.write_text("\n".join(lines), encoding="utf-8")
+    try:
+        try:
+            _run_ffmpeg(["-f", "concat", "-safe", "0", "-i", str(list_file), "-c", "copy", str(dest)])
+        except RuntimeError:
+            if dest.exists():
+                dest.unlink()
+            _run_ffmpeg(
+                [
+                    "-f",
+                    "concat",
+                    "-safe",
+                    "0",
+                    "-i",
+                    str(list_file),
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-crf",
+                    "20",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "128k",
+                    str(dest),
+                ]
+            )
+    finally:
+        list_file.unlink(missing_ok=True)
+    return dest
+
+
+def compress_for_whatsapp(
+    src: str | Path,
+    preset: str = "720p",
+    output_dir: str | Path | None = None,
+) -> Path:
+    if preset not in WHATSAPP_PRESETS:
+        raise ValueError(f"Preset no válido. Usa: {', '.join(WHATSAPP_PRESETS)}")
+    cfg = WHATSAPP_PRESETS[preset]
+    src = Path(src)
+    folder = Path(output_dir) if output_dir else src.parent
+    dest = unique_path(folder / f"{src.stem}_whatsapp.mp4")
+    vf = (
+        f"scale={cfg['max_w']}:{cfg['max_h']}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
+        f"fps={cfg['fps']},format=yuv420p"
+    )
+    _run_ffmpeg(
+        [
+            "-i",
+            str(src),
+            "-vf",
+            vf,
+            "-c:v",
+            "libx264",
+            "-profile:v",
+            "main",
+            "-pix_fmt",
+            "yuv420p",
+            "-preset",
+            "veryfast",
+            "-crf",
+            str(cfg["crf"]),
+            "-c:a",
+            "aac",
+            "-b:a",
+            f"{cfg['audio_k']}k",
+            "-ac",
+            "2",
+            "-ar",
+            "44100",
+            "-movflags",
+            "+faststart",
+            "-map_metadata",
+            "-1",
+            str(dest),
+        ]
+    )
+    return dest
+
+
+def strip_av_metadata(
+    src: str | Path,
+    overwrite: bool = False,
+    output_dir: str | Path | None = None,
+    *,
+    deep: bool = False,
+) -> Path:
     src = Path(src)
     suffix = src.suffix.lower()
     if suffix not in VIDEO_EXTS | AUDIO_EXTS:
         raise ValueError(f"No es un archivo de audio/video: {src.name}")
 
     folder = Path(output_dir) if output_dir else src.parent
-    dest = src if overwrite else _unique_path(folder / f"{src.stem}_sin_metadatos{src.suffix}")
-    tmp = src.with_name(f".{src.stem}_nometa_{src.suffix}")
+    dest = src if overwrite else unique_path(folder / f"{src.stem}_sin_metadatos{src.suffix}")
+    tmp = unique_path(src.with_name(f".{src.stem}_nometa{src.suffix}"))
+    extra = ["-map_metadata", "-1", "-map_chapters", "-1"]
+    if deep:
+        extra += ["-fflags", "+bitexact", "-flags:v", "+bitexact", "-flags:a", "+bitexact"]
 
     try:
         try:
-            _run_ffmpeg(["-i", str(src), "-map_metadata", "-1", "-c", "copy", str(tmp)])
+            _run_ffmpeg(["-i", str(src), *extra, "-c", "copy", str(tmp)])
         except RuntimeError:
             if tmp.exists():
                 tmp.unlink()
-            _run_ffmpeg(["-i", str(src), "-map_metadata", "-1", str(tmp)])
+            _run_ffmpeg(["-i", str(src), *extra, str(tmp)])
         if overwrite:
             tmp.replace(src)
             return src
